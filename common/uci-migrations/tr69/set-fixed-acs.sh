@@ -5,7 +5,7 @@ uci set easycwmp.@acs[0].path=/
 uci set easycwmp.@acs[0].periodic_enable=1
 uci set easycwmp.@acs[0].periodic_interval=3600
 uci set easycwmp.@acs[0].scheme=https
-uci set easycwmp.@acs[0].hostname=acs.carrierwrt.org
+uci set easycwmp.@acs[0].hostname=acs.connectedtek.com
 uci set easycwmp.@acs[0].port=7548
 uci commit easycwmp
 
