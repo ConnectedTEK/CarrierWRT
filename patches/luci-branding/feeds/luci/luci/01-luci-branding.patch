@@ -7,7 +7,7 @@
 -    <div class="container">
 -     <a class="brand" href="#"><%=hostname%></a>
 +    <div class="container" style="height: 40px">
-+     <a class="brand" href="#"><img src="/luci-static/resources/icons/carrierwrt.png"/></a>
++     <a class="brand" href="#"><img src="/luci-static/resources/icons/logo.png"/></a>
       <ul class="nav">
  	 <%-
  		local function submenu(prefix, node)
