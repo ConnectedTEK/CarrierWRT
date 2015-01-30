@@ -1,0 +1,227 @@
+#!/bin/bash -e
+#
+# Installation script for GenieACS, tested on Ubuntu 14.04 LTS 64-bit
+# (AWS ami-394ecc4e).
+#
+
+GENIEACS_URL=https://github.com/zaidka/genieacs
+GENIEACS_VER=82b02ff17548f2d5b101981e7dc3539e0175f980
+
+GENIEACS_GUI_URL=https://github.com/zaidka/genieacs-gui
+GENIEACS_GUI_VER=d791fa49ae85365dc4004b7c6642d42840a1f500
+
+BINDIR=/usr/local/bin
+LIBDIR=/usr/local/lib
+RUNDIR=/var/local/run
+WANIF=eth0
+
+do_install() {
+    IP=$(ifconfig $WANIF | grep 'inet addr:' | cut -d: -f2 | cut -d' ' -f1)
+    if [ -z "$IP" ]; then
+       echo "WAN interface $WANIF is not configured." 2>&1
+       echo "Please configure it with a public IP address." 2>&1
+       exit 1
+    fi
+
+    # Create the genieacs user
+    if ! getent passwd genieacs >/dev/null 2>&1; then
+        sudo adduser --system --no-create-home genieacs
+        sudo addgroup --system genieacs
+        sudo adduser genieacs genieacs
+    fi
+
+    # Ensure package index is up to date
+    sudo apt-get update
+
+    # Install dependencies
+    sudo apt-get install -y mongodb=1:2.4.9-1ubuntu2
+    # NOTE: MongoDB will not run with less than ~3GB disk space, unless the
+    #       option smallfiles=true is in its config file.
+    if grep -q "^smallfiles" /etc/mongodb.conf; then
+        sudo sed -i -e 's/^smallfiles.*/smallfiles=true/' /etc/mongodb.conf
+    else
+        sudo sed -i -e '$asmallfiles=true' /etc/mongodb.conf
+    fi
+    sudo service mongodb restart
+    sudo apt-get install -y redis-server nodejs nodejs-legacy npm git
+    sudo apt-get install -y libsqlite3-dev ruby rails
+
+    # Check out and install the GenieACS package
+    git clone $GENIEACS_URL /tmp/genieacs
+    (cd /tmp/genieacs && git checkout $GENIEACS_VER)
+    (cd /tmp/genieacs && npm install && npm run configure && npm run compile)
+    (cd /tmp/genieacs && sudo npm install --global)
+
+    # Check out and install the GenieACS GUI package
+    sudo mkdir -p $LIBDIR/genieacs-gui
+    sudo chown genieacs:genieacs $LIBDIR/genieacs-gui
+    sudo -u genieacs git clone $GENIEACS_GUI_URL $LIBDIR/genieacs-gui
+    (cd $LIBDIR/genieacs-gui && sudo -h genieacs git checkout $GENIEACS_GUI_VER)
+    (cd $LIBDIR/genieacs-gui && sudo -h genieacs bundle)
+    for FILE in $LIBDIR/genieacs-gui/config/*-sample.*; do
+        sudo -u genieacs cp $FILE $(echo $FILE | sed -e 's/-sample//')
+    done
+
+    # Generate the main GenieACS upstart config
+    cat <<EOF >/tmp/genieacs.conf
+description "GenieACS"
+start on (started mongodb and started networking)
+stop on (stopping mongodb)
+respawn
+exec start-stop-daemon --start --chuid genieacs --make-pidfile \\
+         --pidfile $RUNDIR/genieacs-cwmp.pid --name genieacs-cwmp \\
+         --startas $BINDIR/genieacs-launcher -- $BINDIR/genieacs-cwmp
+EOF
+
+    # Generate the GenieACS file server upstart config
+    cat <<EOF >/tmp/genieacs-fs.conf
+description "GenieACS file server"
+start on (started genieacs)
+stop on (stopping genieacs)
+respawn
+exec start-stop-daemon --start --chuid genieacs --make-pidfile \\
+         --pidfile $RUNDIR/genieacs-fs.pid --name genieacs-fs \\
+         --startas $BINDIR/genieacs-launcher -- $BINDIR/genieacs-fs
+EOF
+
+    # Generate the GenieACS northbound interface upstart config
+    cat <<EOF >/tmp/genieacs-nbi.conf
+description "GenieACS northbound interface"
+start on (started genieacs)
+stop on (stopping genieacs)
+respawn
+exec start-stop-daemon --start --chuid genieacs --make-pidfile \\
+         --pidfile $RUNDIR/genieacs-nbi.pid --name genieacs-nbi \\
+         --startas $BINDIR/genieacs-launcher -- $BINDIR/genieacs-nbi
+EOF
+
+    # Generate the GenieACS GUI upstart config
+    cat <<EOF >/tmp/genieacs-gui.conf
+description "GenieACS GUI"
+start on (started genieacs-nbi)
+stop on (stopping genieacs-nbi)
+respawn
+kill signal INT
+
+script
+    cd $LIBDIR/genieacs-gui
+    sudo -u genieacs rails server -b localhost
+end script
+EOF
+
+    # Generate the GenieACS launcher wrapper
+    cat <<EOF >/tmp/genieacs-launcher
+#!/bin/bash
+
+if [ \$# -lt 1 ]; then
+    echo "Usage: \$0 <daemon>" 2>\&1
+   exit 1
+fi
+
+DAEMON=\$(basename \$1)
+LOGPIPE=$RUNDIR/genieacs/\$DAEMON-log.pipe
+ERRPIPE=$RUNDIR/genieacs/\$DAEMON-err.pipe
+
+cleanup() {
+    rm -f \$LOGPIPE \$ERRPIPE
+    kill \$(jobs -p)
+}
+
+trap cleanup EXIT
+mknod \$LOGPIPE p
+mknod \$ERRPIPE p
+logger <\$LOGPIPE -t \$DAEMON -p user.info &
+logger <\$ERRPIPE -t \$DAEMON -p user.error &
+
+exec >\$LOGPIPE 2>\$ERRPIPE
+\$1
+EOF
+
+    # Generate the GenieACS JSON config
+    cat <<EOF >/tmp/genieacs.json
+{
+  "DATABASE_NAME" : "genieacs",
+  "MONGODB_SOCKET" : "/tmp/mongodb-27017.sock",
+  "REDIS_SOCKET" : "6379",
+  "ACS_INTERFACE" : "$IP",
+  "ACS_PORT" : 7547,
+  "ACS_HTTPS_INTERFACE" : "$IP",
+  "ACS_HTTPS_PORT" : 7548,
+  "API_INTERFACE" : "127.0.0.1",
+  "API_PORT" : 7557,
+  "FILES_INTERFACE" : "$IP",
+  "FILES_PORT" : 7567,
+  "FILES_IP" : "$IP",
+  "LOG_INFORMS" : true,
+  "LIBXMLJS_OPTIONS" : {"recover" : true},
+  "DEBUG_DEVICES" : {}
+}
+EOF
+
+    # Override the GenieACS GUI summary config
+    cat <<EOF >/tmp/summary_parameters.yml
+Serial number: summary.serialNumber
+Product class: summary.productClass
+OUI: summary.oui
+Manufacturer: summary.manufacturer
+Hardware version: summary.hardwareVersion
+Software version: summary.softwareVersion
+MAC: summary.mac
+IP: summary.ip
+WLAN SSID: summary.wlanSsid
+WLAN passphrase: summary.wlanPassphrase
+EOF
+
+    # Install generated files and directories
+    sudo ln -nfs $LIBDIR/node_modules/genieacs/config /etc/genieacs
+    sudo install -m 644 /tmp/genieacs.json /etc/genieacs/config.json
+    sudo install -m 644 /tmp/genieacs.conf /etc/init
+    sudo install -m 644 /tmp/genieacs-fs.conf /etc/init
+    sudo install -m 644 /tmp/genieacs-nbi.conf /etc/init
+    sudo install -m 644 /tmp/genieacs-gui.conf /etc/init
+    sudo install -m 755 /tmp/genieacs-launcher $BINDIR
+    sudo install -m 755 -d $RUNDIR/genieacs
+    sudo chown genieacs:genieacs $RUNDIR/genieacs
+
+    # Install overrides
+    sudo install -m 644 /tmp/summary_parameters.yml $LIBDIR/genieacs-gui/config
+
+    # Clean up
+    rm -rf /tmp/genieacs* /etc/summary_parameters.yml
+
+    echo "================================================================"
+    echo " GenieACS installed in $BINDIR with main configuration in"
+    echo " /etc/genieacs/config.json. Please see http://genieacs.com"
+    echo " for more details on configuration and usage."
+    echo " Run \"sudo start genieacs\" to start the ACS service."
+    echo "================================================================"
+}
+
+do_uninstall() {
+    if sudo status genieacs | grep -q running; then
+        echo "Refusing to uninstall while GenieACS is running." 2>&1
+        echo "Run \"sudo stop genieacs\" first." 2>&1
+        exit 1
+    fi
+    sudo stop genieacs || true
+    sudo npm uninstall --global genieacs
+    sudo rm -f /etc/genieacs
+    sudo rm -f /etc/init/genieacs{,-fs,-nbi,gui}.conf
+    sudo rm -f $BINDIR/genieacs-launcher
+    sudo rm -rf $RUNDIR/genieacs
+    sudo rm -rf $LIBDIR/genieacs-gui
+}
+
+case $1 in
+    --uninstall)
+        do_uninstall
+        ;;
+
+    --install|"")
+        do_install
+        ;;
+
+    *)
+        echo "Usage: $0 [--uninstall]"
+        ;;
+esac
